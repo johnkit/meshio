@@ -214,6 +214,125 @@ def _write_cell_data(filename, dim, cell_data):
     tree.write(filename)
 
 
+def _write_surface_domains(filename, mesh):
+    """"""
+    surface_logger = logging.getLogger('dolfin-surface')
+    surface_logger.setLevel(logging.INFO)
+
+    # Generate lookup for mesh face by vertex list
+    mface_lookup = dict() # <[v0, v1, v2], mface_index, gface_id>
+    mface_index = 0
+    gface_id = 1
+
+    def rotate_tuple(t):
+        return t[1:] + t[:1]
+
+    for block_index in range(len(mesh.cells)):
+        cell_block = mesh.cells[block_index]
+        surface_logger.debug('CHECKPOINT 001 {}, {}, {}, {}'.format(len(cell_block), cell_block, cell_block.type, cell_block.data.shape))
+
+        if cell_block.type == 'triangle':
+            for row in cell_block.data:
+                # Insert all 3 variations of the triangle vertices into mface_lookup
+                t1 = tuple(row)
+                t2 = rotate_tuple(t1)
+                t3 = rotate_tuple(t2)
+                surface_logger.debug('ROW {} {} {} {} {}'.format(t1, t2, t3, mface_index, gface_id))
+                for t in [t1, t2, t3]:
+                    mface_lookup[t] = (mface_index, gface_id)
+                mface_index += 1
+            gface_id += 1
+            # break
+
+        surface_logger.debug('CHECKPOINT 050 {}, {}. {}. {}'.format(cell_block, type(cell_block), type(cell_block.data), cell_block.data.shape))
+
+    # surface_logger.debug('CHECKPOINT 098', mface_lookup)
+    surface_logger.debug('CHECKPOINT 099', len(mface_lookup))
+
+    # Initialize xml tree
+    dolfin = ET.Element("dolfin", nsmap={"dolfin": "https://fenicsproject.org/"})
+    mesh_function = ET.SubElement(dolfin, 'mesh_function')
+    value_collection = ET.SubElement(
+        mesh_function,
+        "mesh_value_collection",
+        type='uint',
+        dim='2',
+        size='1',
+    )
+
+    # Traverse tets and generate lookup
+    # from vtkTetra.cxx:
+    # static constexpr vtkIdType faces[vtkTetra::NumberOfFaces][vtkTetra::MaximumFaceSize + 1] = {
+    #   { 0, 1, 3, -1 }, // 0
+    #   { 1, 2, 3, -1 }, // 1
+    #   { 2, 0, 3, -1 }, // 2
+    #   { 0, 2, 1, -1 }, // 3
+    # };
+
+    # Make dict <tet_id, (local_entity, gface_id)>
+    value_dict = dict()
+
+    # For checking only, make dict <mface_id, (local_entity, gface_id, verts)
+    check_dict = dict()
+
+    face_count = [0] * gface_id
+    tet_index = 0
+    for block_index in range(len(mesh.cells)):
+        cell_block = mesh.cells[block_index]
+        if cell_block.type != 'tetra':
+            continue
+
+        for i, row in enumerate(cell_block.data):
+            v = tuple(row)
+            surface_logger.debug('TET', tet_index, v)
+            # Enumerate vertex ordering for faces in tet (vtk)
+            t1 = (v[0], v[1], v[3])
+            t2 = (v[1], v[2], v[3])
+            t3 = (v[2], v[0], v[3])
+            t4 = (v[0], v[2], v[1])
+            tet_string = str(tet_index)
+            for j, t in enumerate([t1, t2, t3, t4]):
+                value = mface_lookup.get(t)
+                if value is None:
+                    value_attr = '0'
+                else:
+                    mface_index, gface_id = value
+                    surface_logger.debug('  MATCH', tet_index, 'LOCAL_ENTITY', j, 'VALUE', gface_id, 'VERTS:', t)
+                    value_attr = str(gface_id)
+                    face_count[gface_id] += 1
+                    check_dict[mface_index] = (j, gface_id, t)
+
+                ET.SubElement(
+                    value_collection,
+                    'value',
+                    cell_index=tet_string,
+                    local_entity=str(j),
+                    value=value_attr
+                )
+
+            tet_index += 1
+    print('Surface mesh counts:', face_count)
+
+    value_count = 4 * tet_index
+    value_collection.set('size', str(value_count))
+
+    # Debug output for box mesh test case
+    # for key in sorted(check_dict):
+    #     local_entity, gface_id, t = check_dict[key]
+    #     print(key+81, t[0]+1, t[1]+1, t[2]+1, gface_id)
+
+    # tree = ET.ElementTree(dolfin)
+    # tree.write(filename)
+
+    # For now, use minidom to write pretty-format xml
+    from xml.dom import minidom
+    et_string = ET.tostring(dolfin)
+    xml_string = minidom.parseString(et_string).toprettyxml(indent='  ')
+    with open(filename, 'w') as f:
+        f.write(xml_string)
+        print('Wrote {} for triangles'.format(filename))
+
+
 def write(filename, mesh):
     logging.warning("DOLFIN XML is a legacy format. Consider using XDMF instead.")
 
@@ -235,6 +354,11 @@ def write(filename, mesh):
             cell_data_filename = f"{fname}_{name}.xml"
             dim = 2 if mesh.points.shape[1] == 2 or all(mesh.points[:, 2] == 0) else 3
             _write_cell_data(cell_data_filename, dim, np.array(data))
+
+
+    fname, ext = os.path.splitext(filename)
+    surface_filename = f"{fname}_gmsh:surface.xml"
+    _write_surface_domains(surface_filename, mesh)
 
 
 register("dolfin-xml", [".xml"], read, {"dolfin-xml": write})
